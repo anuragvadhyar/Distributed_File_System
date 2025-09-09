@@ -1,9 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type BlockInfo struct {
@@ -76,30 +78,48 @@ func store_in_disk(fileName *os.File, target map[string][]string) error {
 	return nil
 }
 
-func load_file_metadata_from_disk(wg *sync.WaitGroup, file_name string) {
+func load_file_metadata_from_disk(wg *sync.WaitGroup, target map[string]FileMetadata, db *sql.DB) {
 	defer wg.Done()
-	file, err := os.OpenFile(file_name, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatal(err)
+	rows, db_err := db.Query(`SELECT id, path, file_name, permissions, replication_factor, file_size FROM FILE_METADATA`)
+	if db_err != nil {
+		log.Fatal("Error accessing db!")
 		return
 	}
-	defer file.Close()
-	file_length, err := file.Seek(0, io.SeekEnd)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	_, err = file.Seek(0, io.SeekStart)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	if file_length != 0 {
-		decoder := json.NewDecoder(file)
-		err = decoder.Decode(&fileMetadataMap)
-		if err != nil {
-			log.Fatal(err)
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, path, fileName, permissions string
+		var replicationFactor, fileSize int
+		if err := rows.Scan(&id, &path, &fileName, &permissions, &replicationFactor, &fileSize); err != nil {
+			log.Fatal("Error scanning row:", err)
 			return
+		}
+		// Compose the key as path+fileName (to match your map usage)
+		blockRows, err := db.Query(`SELECT block_id, datanode_id FROM BLOCKS WHERE file_id = ?`, id)
+		if err != nil {
+			log.Fatal("Error querying blocks:", err)
+			return
+		}
+		blocks := []BlockInfo{}
+		for blockRows.Next() {
+			var blockID, datanodeID string
+			if err := blockRows.Scan(&blockID, &datanodeID); err != nil {
+				log.Fatal("Error scanning block row:", err)
+				return
+			}
+			blocks = append(blocks, BlockInfo{
+				ID:         blockID,
+				DataNodeID: datanodeID,
+			})
+		}
+		blockRows.Close()
+
+		key := path + fileName
+		target[key] = FileMetadata{
+			Permissions:       permissions,
+			ReplicationFactor: replicationFactor,
+			FileSize:          fileSize,
+			Blocks:            blocks,
 		}
 	}
 }
@@ -127,13 +147,23 @@ func (m *MasterNode) MakeDirCommand(path string, reply *string) error {
 	children := folderHierarchy[current_directory]
 	isValidPath := is_valid_structure(&path)
 	if !isValidPath {
-		return fmt.Errorf("Invalid directory name!")
+		return fmt.Errorf("invalid directory name")
 	}
 	if slices.Contains(children, path) {
-		return fmt.Errorf("Directory already exists on this level")
+		return fmt.Errorf("directory already exists on this level")
 	}
 	folderHierarchy[current_directory] = append(folderHierarchy[current_directory], path)
 	folderHierarchy[current_directory+path+"/"] = []string{}
+	res, err := db.Exec(`UPDATE FOLDERS SET directory = ? WHERE parent_path = ? AND directory IS NULL`, path, current_directory)
+	rowsAffected, _ := res.RowsAffected()
+	if err != nil || rowsAffected == 0 {
+		// If no row was updated, insert as usual
+		db.Exec(`INSERT INTO FOLDERS(parent_path, directory) VALUES (?, ?)`, current_directory, path)
+	}
+
+	// Always ensure the new directory exists as a parent (for leaf/empty dirs)
+	db.Exec(`INSERT OR IGNORE INTO FOLDERS(parent_path, directory) VALUES (?, ?)`, current_directory+path+"/", nil)
+
 	*reply = "Directory created successfully"
 	return nil
 }
@@ -157,7 +187,7 @@ func (m *MasterNode) ChangeDirCommand(path string, reply *string) error {
 	defer m.mu.Unlock()
 	if path == ".." {
 		if current_directory == "/" {
-			return fmt.Errorf("In root dir!")
+			return fmt.Errorf("in root dir")
 		}
 		dir := current_directory
 		if strings.HasSuffix(dir, "/") && len(dir) > 1 {
@@ -172,9 +202,11 @@ func (m *MasterNode) ChangeDirCommand(path string, reply *string) error {
 		current_directory = dir
 		return nil
 	}
+	fmt.Println(current_directory)
+	fmt.Println(path)
 	_, exists := folderHierarchy[(current_directory)+path]
 	if !exists {
-		return fmt.Errorf("Directory doesn't exist")
+		return fmt.Errorf("directory doesn't exist")
 	}
 	current_directory = (current_directory) + path
 	*reply = "Directory Changed Successfully"
@@ -186,7 +218,7 @@ func (m *MasterNode) RemoveCommand(path string, reply *string) error {
 	defer m.mu.Unlock()
 	index := slices.Index(folderHierarchy[current_directory], path)
 	if index == -1 {
-		return fmt.Errorf("Directory doesn't exist")
+		return fmt.Errorf("directory doesn't exist")
 	}
 	folderHierarchy[current_directory] = append(folderHierarchy[current_directory][:index],
 		folderHierarchy[current_directory][index+1:]...)
@@ -203,28 +235,29 @@ func (m *MasterNode) CreateFileCommand(args string, reply *string) error {
 	defer m.mu.Unlock()
 	fields := strings.Fields(args)
 	if len(fields) < 1 {
-		return fmt.Errorf("Filename must be provided!")
+		return fmt.Errorf("filename must be provided")
 	}
 	file_name := fields[0]
 	children := fileHierarchy[current_directory]
 	isValidPath := is_valid_structure(&file_name)
 	if !isValidPath {
-		return fmt.Errorf("Invalid file name!")
+		return fmt.Errorf("invalid file name")
 	}
 	if slices.Contains(children, file_name) {
-		return fmt.Errorf("File already exists on this level")
+		return fmt.Errorf("file already exists on this level")
 	}
 	fileHierarchy[current_directory] = append(fileHierarchy[current_directory], file_name)
+	db.Exec(`INSERT INTO FILE_MAPPINGS(path, file_name) VALUES (?, ?)`, current_directory, file_name)
 	if len(fields) > 2 {
 		replicationFactor, err := strconv.Atoi(fields[2])
 		if err != nil {
-			return fmt.Errorf("Invalid replication factor")
+			return fmt.Errorf("invalid replication factor")
 		}
 		fileSize := 0
 		if len(fields) > 3 {
 			fileSize, err = strconv.Atoi(fields[3])
 			if err != nil {
-				return fmt.Errorf("Invalid file size")
+				return fmt.Errorf("invalid file size")
 			}
 		}
 		blocks := make([]BlockInfo, 0)
@@ -243,34 +276,25 @@ func (m *MasterNode) CreateFileCommand(args string, reply *string) error {
 			FileSize:          fileSize,
 			Blocks:            blocks,
 		}
-		file, err := os.OpenFile("file_metadata.json", os.O_RDWR|os.O_CREATE, 0644)
+
+		res, err := db.Exec(`INSERT INTO FILE_METADATA(path, file_name, permissions, replication_factor, file_size) VALUES (?, ?, ?, ?, ?)`,
+			current_directory, file_name, fields[1], replicationFactor, fileSize)
 		if err != nil {
-			return fmt.Errorf("%v", err)
+			return fmt.Errorf("failed to insert file metadata: %v", err)
 		}
-		defer file.Close()
-		file_length, err := file.Seek(0, io.SeekEnd)
+		fileID, err := res.LastInsertId()
 		if err != nil {
-			return fmt.Errorf("%v", err)
+			return fmt.Errorf("failed to get last insert id: %v", err)
 		}
-		_, err = file.Seek(0, io.SeekStart)
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
-		if file_length != 0 {
-			decoder := json.NewDecoder(file)
-			err = decoder.Decode(&fileMetadataMap)
+		// Insert each block with the retrieved file_id
+		for _, block := range blocks {
+			_, err := db.Exec(`INSERT INTO BLOCKS(block_id, file_id, datanode_id) VALUES (?, ?, ?)`,
+				block.ID, fileID, block.DataNodeID)
 			if err != nil {
-				return fmt.Errorf("%v", err)
+				return fmt.Errorf("failed to insert block: %v", err)
 			}
 		}
 		fileMetadataMap[current_directory+file_name] = m
-		file.Truncate(0)
-		file.Seek(0, 0)
-		encoder := json.NewEncoder(file)
-		err = encoder.Encode(fileMetadataMap)
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
 	}
 	*reply = strings.Join(block_Ids, " ")
 	return nil
@@ -280,18 +304,18 @@ func (m *MasterNode) GetFileInfoCommand(path string, reply *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(path) == 0 {
-		return fmt.Errorf("Path must be provided!")
+		return fmt.Errorf("path must be provided")
 	}
 	if rune(path[0]) == '/' {
 		path = path[1:]
 	}
 	meta, exists := fileMetadataMap[current_directory+path]
 	if !exists {
-		return fmt.Errorf("File doesn't exist in given path %s!\n", current_directory+path)
+		return fmt.Errorf("file doesn't exist in given path %s", current_directory+path)
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
-		return fmt.Errorf("Failed to marshal metadata: %v", err)
+		return fmt.Errorf("failed to marshal metadata: %v", err)
 	}
 	*reply = string(data)
 	return nil
@@ -318,53 +342,69 @@ func (m *MasterNode) Discover(d_node string, reply *string) error {
 	defer m.mu.Unlock()
 	_, exists := m.datanodes[d_node]
 	if !exists {
-		return fmt.Errorf("Error Reaching Datanode %s", d_node)
+		return fmt.Errorf("error Reaching Datanode %s", d_node)
 	}
 	*reply = "localhost:" + m.datanodes[d_node].tcp
 	return nil
 }
 
-func load_from_disk(wg *sync.WaitGroup, file_name string, target map[string][]string) {
+func load_from_disk(wg *sync.WaitGroup, table string, target map[string][]string, db *sql.DB) {
 	defer wg.Done()
-	file, err := os.OpenFile(file_name, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	file_length, err := file.Seek(0, io.SeekEnd)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	_, err = file.Seek(0, io.SeekStart)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-	if file_length != 0 {
-		err = load_into_map(file, target)
-		if err != nil {
-			log.Fatal(err)
+	switch table {
+	case "FOLDERS":
+		rows, db_err := db.Query(`SELECT parent_path, directory FROM FOLDERS`)
+		if db_err != nil {
+			log.Fatal("Error accessing db!")
 			return
 		}
-	}
-	file.Close()
-}
+		defer rows.Close()
 
-func save_to_disk(wg *sync.WaitGroup, file_name string, target map[string][]string) {
-	defer wg.Done()
-	file, err := os.OpenFile(file_name, os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		log.Fatal(err)
-		return
+		for rows.Next() {
+			var parentPath string
+			var directory sql.NullString
+			if err := rows.Scan(&parentPath, &directory); err != nil {
+				log.Fatal("Error scanning row:", err)
+				return
+			}
+			if directory.Valid {
+				target[parentPath] = append(target[parentPath], directory.String)
+			} else {
+				// If directory is NULL, ensure the key exists with an empty slice
+				if _, exists := target[parentPath]; !exists {
+					target[parentPath] = []string{}
+				}
+			}
+		}
+
+	case "FILE_MAPPINGS":
+		rows, db_err := db.Query(`SELECT path, file_name FROM FILE_MAPPINGS`)
+		if db_err != nil {
+			log.Fatal("Error accessing db!")
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var parentPath, file_name string
+			if err := rows.Scan(&parentPath, &file_name); err != nil {
+				log.Fatal("Error scanning row:", err)
+				return
+			}
+			target[parentPath] = append(target[parentPath], file_name)
+		}
 	}
-	store_in_disk(file, target)
-	file.Close()
 }
 
 var nameNode *MasterNode
+var db *sql.DB
 
 func init_namenode() {
+	//add init for connections to client and mules
+	var db_err error
+	db, db_err = init_DB()
+	if db_err != nil {
+		log.Fatal(db_err)
+	}
 	nameNode = &MasterNode{
 		wg:              new(sync.WaitGroup),
 		mu:              &sync.Mutex{},
@@ -380,9 +420,9 @@ func init_namenode() {
 	}
 	fmt.Println("NameNode is listening on port 8080...")
 	nameNode.wg.Add(3)
-	go load_from_disk(nameNode.wg, "folder_directory.json", folderHierarchy)
-	go load_from_disk(nameNode.wg, "file_mappings.json", fileHierarchy)
-	go load_file_metadata_from_disk(nameNode.wg, "file_metadata.json")
+	go load_from_disk(nameNode.wg, "FOLDERS", folderHierarchy, db)
+	go load_from_disk(nameNode.wg, "FILE_MAPPINGS", fileHierarchy, db)
+	go load_file_metadata_from_disk(nameNode.wg, fileMetadataMap, db)
 	nameNode.wg.Wait()
 	go func() {
 		rpc.Accept(nameNode.listener)
@@ -390,11 +430,6 @@ func init_namenode() {
 }
 
 func destroy_namenode() {
-	nameNode.wg.Add(2)
-	go save_to_disk(nameNode.wg, "folder_directory.json", folderHierarchy)
-	go save_to_disk(nameNode.wg, "file_mappings.json", fileHierarchy)
-	nameNode.wg.Wait()
-
 	if nameNode.listener != nil {
 		err := nameNode.listener.Close()
 		if err != nil {
@@ -429,9 +464,70 @@ func (m *MasterNode) pollDataNodes() string {
 	return keys[randomIndex]
 }
 
+func init_DB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", "DFS")
+	if err != nil {
+		return nil, err
+	}
+	// defer db.Close()
+	// Create folders table
+	_, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS FOLDERS (
+            parent_path TEXT,
+            directory   TEXT,
+			PRIMARY KEY (parent_path, directory)
+        )
+    `)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create file_mappings table
+	_, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS FILE_MAPPINGS (
+            path      TEXT,
+            file_name TEXT,
+			PRIMARY KEY (path, file_name)
+        )
+    `)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create file_metadata table
+	_, err = db.Exec(`
+    CREATE TABLE IF NOT EXISTS FILE_METADATA (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT,
+        file_name TEXT,
+        permissions TEXT,
+        replication_factor INTEGER,
+        file_size INTEGER,
+        UNIQUE (path, file_name)
+    	)
+	`)
+	if err != nil {
+		return nil, err
+	}
+
+	//create blocks table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS BLOCKS (
+			block_id TEXT PRIMARY KEY,
+			file_id INTEGER,
+			datanode_id TEXT,
+			FOREIGN KEY (file_id) REFERENCES FILE_METADATA(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
 func main() {
 	fmt.Println("Hello, Welcome to Anurag Distributed File System!")
 	init_namenode()
+	fmt.Println(folderHierarchy)
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
@@ -443,3 +539,5 @@ func main() {
 	<-c // Block until signal received
 	destroy_namenode()
 }
+
+//Add Polling algorithm to choose datanodes
